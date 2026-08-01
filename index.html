@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CADトレース - 手書き図面をCAD風に</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="toolbar">
+  <div class="brand">CADトレース</div>
+
+  <div class="group">
+    <label class="filebtn">
+      画像を開く
+      <input type="file" id="imageInput" accept="image/*" hidden>
+    </label>
+    <label class="chk">
+      <input type="checkbox" id="showBg" checked> 元画像を表示
+    </label>
+    <label class="slider-label">
+      不透明度
+      <input type="range" id="bgOpacity" min="0" max="100" value="45">
+    </label>
+  </div>
+
+  <div class="group tools" id="toolGroup">
+    <button class="tool active" data-tool="select" title="選択・削除">選択</button>
+    <button class="tool" data-tool="line" title="直線（連続クリックで連結、Escで終了）">直線</button>
+    <button class="tool" data-tool="rect" title="四角形">四角形</button>
+    <button class="tool" data-tool="circle" title="円">円</button>
+    <button class="tool" data-tool="dimension" title="寸法線">寸法線</button>
+    <button class="tool" data-tool="text" title="文字">文字</button>
+  </div>
+
+  <div class="group">
+    <label class="chk">
+      <input type="checkbox" id="angleSnap" checked> 角度スナップ
+    </label>
+    <select id="angleStep">
+      <option value="15">15°</option>
+      <option value="30">30°</option>
+      <option value="45">45°</option>
+      <option value="90">90°</option>
+    </select>
+    <label class="chk">
+      <input type="checkbox" id="gridSnap"> グリッドスナップ
+    </label>
+    <input type="number" id="gridSize" value="20" min="4" max="200" title="グリッド間隔(px)">
+    <input type="color" id="strokeColor" value="#111111" title="線の色">
+  </div>
+
+  <div class="group">
+    <button id="undoBtn" title="元に戻す (Ctrl+Z)">元に戻す</button>
+    <button id="redoBtn" title="やり直す (Ctrl+Y)">やり直す</button>
+    <button id="clearBtn" class="danger" title="全消去">全消去</button>
+  </div>
+
+  <div class="group">
+    <button id="saveProjBtn">プロジェクト保存</button>
+    <label class="filebtn">
+      プロジェクト読込
+      <input type="file" id="loadProjInput" accept="application/json" hidden>
+    </label>
+    <label class="chk">
+      <input type="checkbox" id="includeBgInExport"> 出力に元画像を含める
+    </label>
+    <button id="exportPdfBtn" class="primary">PDF出力</button>
+  </div>
+</header>
+
+<main class="stage-wrap">
+  <div class="stage" id="stage">
+    <canvas id="bgCanvas"></canvas>
+    <canvas id="drawCanvas"></canvas>
+  </div>
+</main>
+
+<div class="hint" id="hint">直線ツール: クリックで開始点、以後クリックで連結。Escで確定終了。寸法線: 2点をクリックした後、位置を決めて3回目のクリック。</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
