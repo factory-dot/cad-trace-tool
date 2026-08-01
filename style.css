@@ -82,6 +82,22 @@ button.danger { color: var(--danger); border-color: #f3caca; }
   white-space: nowrap;
 }
 
+.review-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 8px;
+  margin-left: 4px;
+  border-left: 1px dashed var(--border);
+}
+.review-controls[hidden] { display: none; }
+
+.candidate-count {
+  font-size: 12px;
+  color: #b45309;
+  white-space: nowrap;
+}
+
 .slider-label {
   display: flex;
   align-items: center;

@@ -25,6 +25,15 @@
   const includeBgInExport = document.getElementById("includeBgInExport");
   const exportPdfBtn = document.getElementById("exportPdfBtn");
   const hint = document.getElementById("hint");
+  const detectThreshold = document.getElementById("detectThreshold");
+  const minSegLenInput = document.getElementById("minSegLen");
+  const detectLinesBtn = document.getElementById("detectLinesBtn");
+  const reviewControls = document.getElementById("reviewControls");
+  const candidateCountEl = document.getElementById("candidateCount");
+  const acceptAllBtn = document.getElementById("acceptAllBtn");
+  const rejectAllBtn = document.getElementById("rejectAllBtn");
+  const commitCandidatesBtn = document.getElementById("commitCandidatesBtn");
+  const alignDimsBtn = document.getElementById("alignDimsBtn");
 
   // ---------- State ----------
   const DEFAULT_W = 1123; // A4 landscape @96dpi
@@ -41,6 +50,8 @@
 
   let historyStack = [];
   let historyIndex = -1;
+
+  let candidates = null; // array of {p1,p2,accepted} while reviewing auto-detected lines
 
   // ---------- Canvas sizing ----------
   function setCanvasSize(w, h) {
@@ -185,6 +196,7 @@
   toolGroup.addEventListener("click", (e) => {
     const btn = e.target.closest(".tool");
     if (!btn) return;
+    if (candidates) { alert("自動検出結果を確定または破棄してから切り替えてください。"); return; }
     setTool(btn.dataset.tool);
   });
 
@@ -278,6 +290,27 @@
     ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
     elements.forEach((el, i) => drawElement(ctx, el, i === selectedIndex));
     if (draft) drawDraft(ctx, draft);
+    if (candidates) drawCandidates(ctx);
+  }
+
+  function drawCandidates(c) {
+    c.save();
+    candidates.forEach(cand => {
+      c.beginPath();
+      c.moveTo(cand.p1.x, cand.p1.y);
+      c.lineTo(cand.p2.x, cand.p2.y);
+      if (cand.accepted) {
+        c.setLineDash([]);
+        c.strokeStyle = "#f97316";
+        c.lineWidth = 2.2;
+      } else {
+        c.setLineDash([4, 4]);
+        c.strokeStyle = "rgba(120,120,120,0.5)";
+        c.lineWidth = 1.4;
+      }
+      c.stroke();
+    });
+    c.restore();
   }
 
   function drawElement(c, el, selected) {
@@ -497,6 +530,411 @@
     return -1;
   }
 
+  // ---------- Candidate review helpers ----------
+  function hitTestCandidates(pt) {
+    const TOL = 8;
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      if (distToSegment(pt, candidates[i].p1, candidates[i].p2) <= TOL) return i;
+    }
+    return -1;
+  }
+
+  function updateCandidateCount() {
+    const accepted = candidates.filter(c => c.accepted).length;
+    candidateCountEl.textContent = `${candidates.length}件中 ${accepted}件採用`;
+  }
+
+  function discardCandidates() {
+    candidates = null;
+    reviewControls.hidden = true;
+    setTool("select");
+  }
+
+  // ---------- Auto line detection (Hough transform) ----------
+  function getBgImageData() {
+    if (!bgImage) return null;
+    const w = drawCanvas.width, h = drawCanvas.height;
+    const tmp = document.createElement("canvas");
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext("2d");
+    tctx.drawImage(bgImage, 0, 0, w, h);
+    return tctx.getImageData(0, 0, w, h);
+  }
+
+  function buildInkMask(imgData, threshold) {
+    const { width, height, data } = imgData;
+    const mask = new Uint8Array(width * height);
+    let minX = width, minY = height, maxX = -1, maxY = -1;
+    let count = 0;
+    for (let y = 0, p = 0, di = 0; y < height; y++) {
+      for (let x = 0; x < width; x++, p++, di += 4) {
+        const lum = 0.299 * data[di] + 0.587 * data[di + 1] + 0.114 * data[di + 2];
+        if (lum < threshold) {
+          mask[p] = 1;
+          count++;
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+      }
+    }
+    const bbox = count > 0
+      ? { x0: Math.max(0, minX - 2), y0: Math.max(0, minY - 2), x1: Math.min(width - 1, maxX + 2), y1: Math.min(height - 1, maxY + 2) }
+      : { x0: 0, y0: 0, x1: width - 1, y1: height - 1 };
+    return { mask, width, height, count, bbox };
+  }
+
+  // Zhang-Suen thinning, restricted to the ink bounding box for performance.
+  function thinMask(mask, w, h, bbox) {
+    const img = mask.slice();
+    const idx = (x, y) => y * w + x;
+    let changed = true;
+    let guard = 0;
+    while (changed && guard < 60) {
+      changed = false;
+      guard++;
+      for (let step = 0; step < 2; step++) {
+        const toRemove = [];
+        for (let y = Math.max(1, bbox.y0); y <= Math.min(h - 2, bbox.y1); y++) {
+          for (let x = Math.max(1, bbox.x0); x <= Math.min(w - 2, bbox.x1); x++) {
+            if (!img[idx(x, y)]) continue;
+            const p2 = img[idx(x, y - 1)], p3 = img[idx(x + 1, y - 1)], p4 = img[idx(x + 1, y)],
+              p5 = img[idx(x + 1, y + 1)], p6 = img[idx(x, y + 1)], p7 = img[idx(x - 1, y + 1)],
+              p8 = img[idx(x - 1, y)], p9 = img[idx(x - 1, y - 1)];
+            const neighbors = [p2, p3, p4, p5, p6, p7, p8, p9];
+            const B = neighbors.reduce((a, b) => a + b, 0);
+            if (B < 2 || B > 6) continue;
+            let A = 0;
+            for (let k = 0; k < 8; k++) if (neighbors[k] === 0 && neighbors[(k + 1) % 8] === 1) A++;
+            if (A !== 1) continue;
+            if (step === 0) {
+              if (p2 * p4 * p6 !== 0) continue;
+              if (p4 * p6 * p8 !== 0) continue;
+            } else {
+              if (p2 * p4 * p8 !== 0) continue;
+              if (p2 * p6 * p8 !== 0) continue;
+            }
+            toRemove.push(idx(x, y));
+          }
+        }
+        if (toRemove.length) { changed = true; toRemove.forEach(i => { img[i] = 0; }); }
+      }
+    }
+    return img;
+  }
+
+  function houghTransform(mask, w, h) {
+    const thetaSteps = 180;
+    const cosT = new Float64Array(thetaSteps);
+    const sinT = new Float64Array(thetaSteps);
+    for (let t = 0; t < thetaSteps; t++) {
+      const rad = (t * Math.PI) / 180;
+      cosT[t] = Math.cos(rad); sinT[t] = Math.sin(rad);
+    }
+    const diag = Math.ceil(Math.hypot(w, h));
+    const rhoOffset = diag;
+    const rhoSteps = diag * 2 + 1;
+    const accumulator = new Int32Array(thetaSteps * rhoSteps);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (!mask[y * w + x]) continue;
+        for (let t = 0; t < thetaSteps; t++) {
+          const rho = Math.round(x * cosT[t] + y * sinT[t]) + rhoOffset;
+          accumulator[t * rhoSteps + rho]++;
+        }
+      }
+    }
+    return { accumulator, thetaSteps, rhoSteps, rhoOffset, cosT, sinT, diag };
+  }
+
+  function findHoughPeaks(hough, minVotes, maxPeaks) {
+    const { accumulator, thetaSteps, rhoSteps } = hough;
+    const found = [];
+    for (let t = 0; t < thetaSteps; t++) {
+      for (let r = 0; r < rhoSteps; r++) {
+        const v = accumulator[t * rhoSteps + r];
+        if (v >= minVotes) found.push({ t, r, v });
+      }
+    }
+    found.sort((a, b) => b.v - a.v);
+    const chosen = [];
+    const thetaWindow = 4, rhoWindow = 8;
+    for (const p of found) {
+      if (chosen.length >= maxPeaks) break;
+      let tooClose = false;
+      for (const c of chosen) {
+        const dt = Math.min(Math.abs(p.t - c.t), thetaSteps - Math.abs(p.t - c.t));
+        if (dt <= thetaWindow && Math.abs(p.r - c.r) <= rhoWindow) { tooClose = true; break; }
+      }
+      if (!tooClose) chosen.push(p);
+    }
+    return chosen;
+  }
+
+  function extractSegmentsForPeak(peak, hough, mask, w, h, minSegLen, gapTolerance) {
+    const { cosT, sinT, rhoOffset, diag } = hough;
+    const cosv = cosT[peak.t], sinv = sinT[peak.t];
+    const rho = peak.r - rhoOffset;
+    const originX = rho * cosv, originY = rho * sinv;
+    const dirX = -sinv, dirY = cosv;
+
+    const isInk = (px, py) => {
+      const rx = Math.round(px), ry = Math.round(py);
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const x = rx + ox, y = ry + oy;
+          if (x >= 0 && x < w && y >= 0 && y < h && mask[y * w + x]) return true;
+        }
+      }
+      return false;
+    };
+
+    const segments = [];
+    let runStart = null, lastHit = null, gap = 0;
+    for (let s = -diag; s <= diag; s++) {
+      const px = originX + dirX * s, py = originY + dirY * s;
+      const inBounds = px >= 0 && px < w && py >= 0 && py < h;
+      const hit = inBounds && isInk(px, py);
+      if (hit) {
+        if (runStart === null) runStart = s;
+        lastHit = s;
+        gap = 0;
+      } else if (runStart !== null) {
+        gap++;
+        if (gap > gapTolerance) {
+          if (lastHit - runStart >= minSegLen) segments.push([runStart, lastHit]);
+          runStart = null; lastHit = null; gap = 0;
+        }
+      }
+    }
+    if (runStart !== null && lastHit - runStart >= minSegLen) segments.push([runStart, lastHit]);
+
+    return segments.map(([s0, s1]) => ({
+      p1: { x: originX + dirX * s0, y: originY + dirY * s0 },
+      p2: { x: originX + dirX * s1, y: originY + dirY * s1 },
+    }));
+  }
+
+  function segAngleDeg(p1, p2) {
+    let a = (Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180) / Math.PI;
+    if (a < 0) a += 180;
+    if (a >= 180) a -= 180;
+    return a;
+  }
+
+  function maybeSnapCandidateAngle(seg) {
+    if (!angleSnapChk.checked) return seg;
+    const step = parseInt(angleStepSel.value, 10) || 15;
+    const len = dist(seg.p1, seg.p2);
+    const angRad = Math.atan2(seg.p2.y - seg.p1.y, seg.p2.x - seg.p1.x);
+    const angDeg = (angRad * 180) / Math.PI;
+    const snappedDeg = Math.round(angDeg / step) * step;
+    if (Math.abs(snappedDeg - angDeg) > 5) return seg; // too far off, keep the real detected angle
+    const snappedRad = (snappedDeg * Math.PI) / 180;
+    const mid = { x: (seg.p1.x + seg.p2.x) / 2, y: (seg.p1.y + seg.p2.y) / 2 };
+    const half = len / 2;
+    return {
+      p1: { x: mid.x - Math.cos(snappedRad) * half, y: mid.y - Math.sin(snappedRad) * half },
+      p2: { x: mid.x + Math.cos(snappedRad) * half, y: mid.y + Math.sin(snappedRad) * half },
+    };
+  }
+
+  function perpDistanceToLine(pt, angleDeg) {
+    const rad = (angleDeg * Math.PI) / 180;
+    const nx = -Math.sin(rad), ny = Math.cos(rad);
+    return pt.x * nx + pt.y * ny;
+  }
+
+  // Merges raw Hough fragments that lie on (nearly) the same line and are close
+  // together end-to-end into single continuous segments. A wobbly hand-drawn
+  // stroke rarely satisfies one strict Hough peak along its whole length, so it
+  // shows up as many short collinear fragments; this stitches them back into
+  // one clean straight line per real stroke.
+  function mergeCollinearSegments(segs, angleTolDeg, perpTolPx, gapTolPx) {
+    const n = segs.length;
+    if (n === 0) return [];
+    const parent = Array.from({ length: n }, (_, i) => i);
+    function find(x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+    function union(a, b) { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; }
+
+    const ang = segs.map(s => segAngleDeg(s.p1, s.p2));
+
+    for (let i = 0; i < n; i++) {
+      const radI = (ang[i] * Math.PI) / 180;
+      const dirXi = Math.cos(radI), dirYi = Math.sin(radI);
+      const iProj = (p) => p.x * dirXi + p.y * dirYi;
+      const i0 = iProj(segs[i].p1), i1 = iProj(segs[i].p2);
+      const iMin = Math.min(i0, i1), iMax = Math.max(i0, i1);
+      const pi = perpDistanceToLine(segs[i].p1, ang[i]);
+      for (let j = i + 1; j < n; j++) {
+        const angDiff = Math.min(Math.abs(ang[i] - ang[j]), 180 - Math.abs(ang[i] - ang[j]));
+        if (angDiff > angleTolDeg) continue;
+        const pj = perpDistanceToLine(segs[j].p1, ang[i]);
+        if (Math.abs(pi - pj) > perpTolPx) continue;
+        const j0 = iProj(segs[j].p1), j1 = iProj(segs[j].p2);
+        const jMin = Math.min(j0, j1), jMax = Math.max(j0, j1);
+        const gap = Math.max(iMin, jMin) - Math.min(iMax, jMax);
+        if (gap > gapTolPx) continue;
+        union(i, j);
+      }
+    }
+
+    const groups = new Map();
+    for (let i = 0; i < n; i++) {
+      const r = find(i);
+      if (!groups.has(r)) groups.set(r, []);
+      groups.get(r).push(i);
+    }
+
+    const merged = [];
+    groups.forEach(idxs => {
+      let longest = idxs[0], longestLen = -1;
+      idxs.forEach(i => { const l = dist(segs[i].p1, segs[i].p2); if (l > longestLen) { longestLen = l; longest = i; } });
+      const refAng = ang[longest];
+      const rad = (refAng * Math.PI) / 180;
+      const dirX = Math.cos(rad), dirY = Math.sin(rad);
+      const nx = -dirY, ny = dirX;
+      const basePerp = perpDistanceToLine(segs[longest].p1, refAng);
+      const originPt = { x: nx * basePerp, y: ny * basePerp };
+      let minProj = Infinity, maxProj = -Infinity;
+      idxs.forEach(i => {
+        [segs[i].p1, segs[i].p2].forEach(p => {
+          const t = (p.x - originPt.x) * dirX + (p.y - originPt.y) * dirY;
+          if (t < minProj) minProj = t;
+          if (t > maxProj) maxProj = t;
+        });
+      });
+      merged.push({
+        p1: { x: originPt.x + dirX * minProj, y: originPt.y + dirY * minProj },
+        p2: { x: originPt.x + dirX * maxProj, y: originPt.y + dirY * maxProj },
+      });
+    });
+
+    return merged;
+  }
+
+  function runLineDetection() {
+    if (!bgImage) { alert("先に画像を読み込んでください。"); return; }
+    const w = drawCanvas.width, h = drawCanvas.height;
+    const threshold = parseInt(detectThreshold.value, 10);
+    const minSegLen = Math.max(6, parseInt(minSegLenInput.value, 10) || 25);
+
+    const imgData = getBgImageData();
+    const { mask, count, bbox } = buildInkMask(imgData, threshold);
+    if (count === 0) {
+      alert("線が検出できませんでした。検出感度を上げてみてください。");
+      return;
+    }
+    if (count > w * h * 0.35) {
+      alert("検出される領域が多すぎます。検出感度を下げてから再度お試しください。");
+      return;
+    }
+
+    const thinned = thinMask(mask, w, h, bbox);
+    const hough = houghTransform(thinned, w, h);
+    const fragmentMinLen = Math.max(6, Math.round(minSegLen * 0.35));
+    const minVotes = Math.max(10, Math.round(fragmentMinLen * 0.5));
+    const peaks = findHoughPeaks(hough, minVotes, 250);
+
+    let raw = [];
+    for (const peak of peaks) {
+      const segs = extractSegmentsForPeak(peak, hough, thinned, w, h, fragmentMinLen, 10);
+      raw.push(...segs);
+    }
+
+    // stitch nearby collinear fragments (typical of a wobbly hand-drawn stroke)
+    // back into single straight segments, then drop anything still too short.
+    let merged = mergeCollinearSegments(raw, 5, 8, Math.max(35, minSegLen * 1.5));
+    merged = merged.filter(s => dist(s.p1, s.p2) >= minSegLen);
+    merged = merged.map(maybeSnapCandidateAngle);
+    merged = mergeCollinearSegments(merged, 3, 6, 20); // clean up any overlap left after snapping
+
+    if (merged.length === 0) {
+      alert("直線が検出できませんでした。検出感度や最小の線の長さを調整してください。");
+      return;
+    }
+
+    candidates = merged.map(s => ({ p1: s.p1, p2: s.p2, accepted: true }));
+    reviewControls.hidden = false;
+    updateCandidateCount();
+    setTool("review");
+    hint.textContent = "オレンジの線が検出結果です。クリックで採用/除外を切り替え、「確定」で図形として取り込みます。Escで破棄。";
+    render();
+  }
+
+  detectLinesBtn.addEventListener("click", () => {
+    detectLinesBtn.disabled = true;
+    const originalLabel = detectLinesBtn.textContent;
+    detectLinesBtn.textContent = "検出中...";
+    setTimeout(() => {
+      try {
+        runLineDetection();
+      } finally {
+        detectLinesBtn.disabled = false;
+        detectLinesBtn.textContent = originalLabel;
+      }
+    }, 30);
+  });
+
+  acceptAllBtn.addEventListener("click", () => {
+    if (!candidates) return;
+    candidates.forEach(c => { c.accepted = true; });
+    updateCandidateCount();
+    render();
+  });
+
+  rejectAllBtn.addEventListener("click", () => {
+    if (!candidates) return;
+    candidates.forEach(c => { c.accepted = false; });
+    updateCandidateCount();
+    render();
+  });
+
+  commitCandidatesBtn.addEventListener("click", () => {
+    if (!candidates) return;
+    const accepted = candidates.filter(c => c.accepted);
+    accepted.forEach(c => {
+      elements.push({ type: "line", points: [c.p1, c.p2], color: strokeColorInput.value });
+    });
+    candidates = null;
+    reviewControls.hidden = true;
+    if (accepted.length > 0) pushHistory();
+    setTool("select");
+  });
+
+  // ---------- Dimension line alignment ----------
+  alignDimsBtn.addEventListener("click", () => {
+    const dims = elements.map((el, i) => ({ el, i })).filter(o => o.el.type === "dimension");
+    if (dims.length === 0) { alert("寸法線がありません。"); return; }
+
+    const groups = new Map();
+    dims.forEach(({ el }) => {
+      const ang = segAngleDeg(el.p1, el.p2);
+      const angBucket = Math.round(ang / 5) * 5;
+      const perp = perpDistanceToLine(el.p1, angBucket);
+      const baseBucket = Math.round(perp / 15) * 15;
+      const sign = el.offset >= 0 ? 1 : -1;
+      const key = `${angBucket}|${baseBucket}|${sign}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(el);
+    });
+
+    let changedGroups = 0;
+    groups.forEach(group => {
+      if (group.length < 2) return;
+      const avg = group.reduce((sum, el) => sum + el.offset, 0) / group.length;
+      const rounded = Math.round(avg / 5) * 5;
+      group.forEach(el => { el.offset = rounded; });
+      changedGroups++;
+    });
+
+    if (changedGroups === 0) {
+      alert("そろえる対象（同じ向き・同じ基準線上にある寸法線）が見つかりませんでした。");
+      return;
+    }
+    pushHistory();
+    render();
+  });
+
   // ---------- Pointer interaction ----------
   let isDown = false;
 
@@ -504,6 +942,12 @@
     drawCanvas.setPointerCapture(e.pointerId);
     const raw = clampToCanvas(getMousePos(e));
     isDown = true;
+
+    if (currentTool === "review" && candidates) {
+      const i = hitTestCandidates(raw);
+      if (i >= 0) { candidates[i].accepted = !candidates[i].accepted; updateCandidateCount(); render(); }
+      return;
+    }
 
     if (currentTool === "select") {
       selectedIndex = hitTest(raw);
@@ -633,7 +1077,8 @@
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-      if (currentTool === "line" && draft) finishLineDraft();
+      if (currentTool === "review" && candidates) { discardCandidates(); }
+      else if (currentTool === "line" && draft) finishLineDraft();
       else { draft = null; selectedIndex = -1; render(); }
     } else if (e.key === "Delete" || e.key === "Backspace") {
       if (currentTool === "select" && selectedIndex >= 0 && document.activeElement === document.body) {
