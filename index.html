@@ -57,11 +57,13 @@
   </div>
 
   <div class="group" id="autoGroup">
-    <label class="slider-label" title="値が大きいほど薄い線まで検出対象になります">
+    <label class="slider-label" title="周囲との明暗差で線を判定します。値が小さいほど薄い線まで検出対象になります">
       検出感度
-      <input type="range" id="detectThreshold" min="60" max="220" value="150">
+      <input type="range" id="detectThreshold" min="3" max="30" value="12">
     </label>
     <input type="number" id="minSegLen" value="25" min="8" max="300" title="検出する最小の線の長さ(px)">
+    <button id="setRegionBtn" title="検出したい範囲だけをドラッグで指定（背景の木目などを除外できます）">検出範囲を指定</button>
+    <button id="resetRegionBtn" title="範囲指定を解除して画像全体を対象にする">範囲解除</button>
     <button id="detectLinesBtn">直線を自動検出</button>
     <span id="reviewControls" class="review-controls" hidden>
       <span id="candidateCount" class="candidate-count"></span>

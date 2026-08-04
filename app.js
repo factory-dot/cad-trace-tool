@@ -27,6 +27,8 @@
   const hint = document.getElementById("hint");
   const detectThreshold = document.getElementById("detectThreshold");
   const minSegLenInput = document.getElementById("minSegLen");
+  const setRegionBtn = document.getElementById("setRegionBtn");
+  const resetRegionBtn = document.getElementById("resetRegionBtn");
   const detectLinesBtn = document.getElementById("detectLinesBtn");
   const reviewControls = document.getElementById("reviewControls");
   const candidateCountEl = document.getElementById("candidateCount");
@@ -52,6 +54,7 @@
   let historyIndex = -1;
 
   let candidates = null; // array of {p1,p2,accepted} while reviewing auto-detected lines
+  let detectRegion = null; // {x0,y0,x1,y1} in canvas px - restricts auto-detection to this area
 
   // ---------- Canvas sizing ----------
   function setCanvasSize(w, h) {
@@ -291,6 +294,16 @@
     elements.forEach((el, i) => drawElement(ctx, el, i === selectedIndex));
     if (draft) drawDraft(ctx, draft);
     if (candidates) drawCandidates(ctx);
+    if (detectRegion) drawDetectRegion(ctx, detectRegion);
+  }
+
+  function drawDetectRegion(c, r) {
+    c.save();
+    c.setLineDash([8, 5]);
+    c.strokeStyle = "#9333ea";
+    c.lineWidth = 1.6;
+    c.strokeRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+    c.restore();
   }
 
   function drawCandidates(c) {
@@ -456,6 +469,11 @@
       const x = Math.min(d.start.x, d.preview.x), y = Math.min(d.start.y, d.preview.y);
       const w = Math.abs(d.preview.x - d.start.x), h = Math.abs(d.preview.y - d.start.y);
       c.strokeRect(x, y, w, h);
+    } else if (d.type === "cropregion" && d.start && d.preview) {
+      c.strokeStyle = "#9333ea";
+      const x = Math.min(d.start.x, d.preview.x), y = Math.min(d.start.y, d.preview.y);
+      const w = Math.abs(d.preview.x - d.start.x), h = Math.abs(d.preview.y - d.start.y);
+      c.strokeRect(x, y, w, h);
     } else if (d.type === "circle" && d.center && d.preview) {
       const r = dist(d.center, d.preview);
       c.beginPath();
@@ -561,15 +579,62 @@
     return tctx.getImageData(0, 0, w, h);
   }
 
-  function buildInkMask(imgData, threshold) {
+  // Integral (summed-area) image of grayscale values, for O(1) box-mean lookups.
+  function buildIntegralImage(gray, w, h) {
+    const stride = w + 1;
+    const integral = new Float64Array(stride * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let rowSum = 0;
+      for (let x = 0; x < w; x++) {
+        rowSum += gray[y * w + x];
+        integral[(y + 1) * stride + (x + 1)] = integral[y * stride + (x + 1)] + rowSum;
+      }
+    }
+    return integral;
+  }
+
+  function boxMean(integral, w, h, x0, y0, x1, y1) {
+    x0 = Math.max(0, x0); y0 = Math.max(0, y0);
+    x1 = Math.min(w - 1, x1); y1 = Math.min(h - 1, y1);
+    const stride = w + 1;
+    const A = integral[y0 * stride + x0];
+    const B = integral[y0 * stride + (x1 + 1)];
+    const C = integral[(y1 + 1) * stride + x0];
+    const D = integral[(y1 + 1) * stride + (x1 + 1)];
+    const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+    return (D - B - C + A) / area;
+  }
+
+  // Adaptive (local-contrast) binarization: a pixel counts as "ink" only if it is
+  // meaningfully darker than its own neighborhood average. This is what makes
+  // detection tolerant of photographed paper - unlike a single global brightness
+  // threshold, it isn't fooled by shadows, uneven lighting, or wood-grain texture
+  // outside the selected region, since each pixel is judged against its own
+  // surroundings rather than a single fixed cutoff.
+  function buildInkMask(imgData, sensitivityPercent, region) {
     const { width, height, data } = imgData;
+    const gray = new Float64Array(width * height);
+    for (let p = 0, di = 0; p < width * height; p++, di += 4) {
+      gray[p] = 0.299 * data[di] + 0.587 * data[di + 1] + 0.114 * data[di + 2];
+    }
+    const integral = buildIntegralImage(gray, width, height);
+    const windowSize = Math.max(20, Math.round(Math.min(width, height) / 8));
+    const half = Math.floor(windowSize / 2);
+    const t = sensitivityPercent / 100;
+
+    const rx0 = region ? Math.max(0, Math.round(region.x0)) : 0;
+    const ry0 = region ? Math.max(0, Math.round(region.y0)) : 0;
+    const rx1 = region ? Math.min(width - 1, Math.round(region.x1)) : width - 1;
+    const ry1 = region ? Math.min(height - 1, Math.round(region.y1)) : height - 1;
+
     const mask = new Uint8Array(width * height);
     let minX = width, minY = height, maxX = -1, maxY = -1;
     let count = 0;
-    for (let y = 0, p = 0, di = 0; y < height; y++) {
-      for (let x = 0; x < width; x++, p++, di += 4) {
-        const lum = 0.299 * data[di] + 0.587 * data[di + 1] + 0.114 * data[di + 2];
-        if (lum < threshold) {
+    for (let y = ry0; y <= ry1; y++) {
+      for (let x = rx0; x <= rx1; x++) {
+        const p = y * width + x;
+        const mean = boxMean(integral, width, height, x - half, y - half, x + half, y + half);
+        if (gray[p] < mean * (1 - t)) {
           mask[p] = 1;
           count++;
           if (x < minX) minX = x; if (x > maxX) maxX = x;
@@ -815,24 +880,27 @@
   function runLineDetection() {
     if (!bgImage) { alert("先に画像を読み込んでください。"); return; }
     const w = drawCanvas.width, h = drawCanvas.height;
-    const threshold = parseInt(detectThreshold.value, 10);
+    const sensitivityPercent = parseInt(detectThreshold.value, 10);
     const minSegLen = Math.max(6, parseInt(minSegLenInput.value, 10) || 25);
 
     const imgData = getBgImageData();
-    const { mask, count, bbox } = buildInkMask(imgData, threshold);
+    const { mask, count, bbox } = buildInkMask(imgData, sensitivityPercent, detectRegion);
+    const regionArea = detectRegion
+      ? (Math.min(w, detectRegion.x1) - Math.max(0, detectRegion.x0)) * (Math.min(h, detectRegion.y1) - Math.max(0, detectRegion.y0))
+      : w * h;
     if (count === 0) {
-      alert("線が検出できませんでした。検出感度を上げてみてください。");
+      alert("線が検出できませんでした。検出感度の値を下げてみてください。");
       return;
     }
-    if (count > w * h * 0.35) {
-      alert("検出される領域が多すぎます。検出感度を下げてから再度お試しください。");
+    if (count > regionArea * 0.35) {
+      alert("検出される領域が多すぎます。検出感度の値を上げるか、検出範囲を絞ってから再度お試しください。");
       return;
     }
 
     const thinned = thinMask(mask, w, h, bbox);
     const hough = houghTransform(thinned, w, h);
     const fragmentMinLen = Math.max(6, Math.round(minSegLen * 0.35));
-    const minVotes = Math.max(10, Math.round(fragmentMinLen * 0.5));
+    const minVotes = Math.max(16, Math.round(fragmentMinLen * 0.85));
     const peaks = findHoughPeaks(hough, minVotes, 250);
 
     let raw = [];
@@ -860,6 +928,17 @@
     hint.textContent = "オレンジの線が検出結果です。クリックで採用/除外を切り替え、「確定」で図形として取り込みます。Escで破棄。";
     render();
   }
+
+  setRegionBtn.addEventListener("click", () => {
+    if (candidates) { alert("自動検出結果を確定または破棄してから操作してください。"); return; }
+    setTool("cropregion");
+    hint.textContent = "検出したい範囲をドラッグで指定してください（背景の木目などを除外できます）。";
+  });
+
+  resetRegionBtn.addEventListener("click", () => {
+    detectRegion = null;
+    render();
+  });
 
   detectLinesBtn.addEventListener("click", () => {
     detectLinesBtn.disabled = true;
@@ -943,6 +1022,12 @@
     const raw = clampToCanvas(getMousePos(e));
     isDown = true;
 
+    if (currentTool === "cropregion") {
+      draft = { type: "cropregion", start: raw, preview: raw };
+      render();
+      return;
+    }
+
     if (currentTool === "review" && candidates) {
       const i = hitTestCandidates(raw);
       if (i >= 0) { candidates[i].accepted = !candidates[i].accepted; updateCandidateCount(); render(); }
@@ -1021,6 +1106,9 @@
       const prev = draft.points[draft.points.length - 1];
       draft.preview = snapPoint(raw, prev);
       render();
+    } else if (currentTool === "cropregion" && draft && isDown) {
+      draft.preview = raw;
+      render();
     } else if (currentTool === "rect" && draft && isDown) {
       draft.preview = snapPoint(raw, null);
       render();
@@ -1035,6 +1123,15 @@
 
   drawCanvas.addEventListener("pointerup", (e) => {
     isDown = false;
+    if (currentTool === "cropregion" && draft && draft.start) {
+      const p = clampToCanvas(getMousePos(e));
+      const x0 = Math.min(draft.start.x, p.x), x1 = Math.max(draft.start.x, p.x);
+      const y0 = Math.min(draft.start.y, p.y), y1 = Math.max(draft.start.y, p.y);
+      if (x1 - x0 > 10 && y1 - y0 > 10) detectRegion = { x0, y0, x1, y1 };
+      draft = null;
+      setTool("select");
+      return;
+    }
     if (currentTool === "rect" && draft && draft.start) {
       const p = snapPoint(clampToCanvas(getMousePos(e)), null);
       if (dist(draft.start, p) > 2) {
